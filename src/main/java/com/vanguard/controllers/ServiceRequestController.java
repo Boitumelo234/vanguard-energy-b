@@ -6,114 +6,130 @@ import com.vanguard.entities.ServiceRequest;
 import com.vanguard.entities.User;
 import com.vanguard.repositories.ServiceRequestRepository;
 import com.vanguard.repositories.UserRepository;
+import com.vanguard.services.NotificationService;
 import com.vanguard.services.PricingService;
 import com.vanguard.utils.JwtUtil;
+import jakarta.validation.Valid;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import jakarta.validation.Valid;
+
 import java.time.LocalDateTime;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 
 @RestController
 @RequestMapping("/requests")
 @CrossOrigin(origins = {"http://localhost:3000", "http://localhost:3001"})
+@Slf4j
 public class ServiceRequestController {
 
-    @Autowired
-    private ServiceRequestRepository requestRepository;
+    @Autowired private ServiceRequestRepository requestRepository;
+    @Autowired private UserRepository userRepository;
+    @Autowired private JwtUtil jwtUtil;
+    @Autowired private PricingService pricingService;
+    @Autowired private NotificationService notificationService;
 
-    @Autowired
-    private UserRepository userRepository;
-
-    @Autowired
-    private JwtUtil jwtUtil;
-
-    @Autowired
-    private PricingService pricingService;
+    // ─── Create ───────────────────────────────────────────────────────────────
 
     @PostMapping("/create")
     public ResponseEntity<?> createRequest(
             @RequestHeader("Authorization") String authHeader,
-            @Valid @RequestBody ServiceRequestDTO requestDTO) {
+            @Valid @RequestBody ServiceRequestDTO dto) {
 
         Long userId = extractUserId(authHeader);
-        Optional<User> userOpt = userRepository.findById(userId);
-
-        if (userOpt.isEmpty()) {
-            return ResponseEntity.badRequest().body(Map.of("error", "User not found"));
-        }
+        User customer = userRepository.findById(userId)
+                .orElseThrow(() -> new RuntimeException("User not found"));
 
         ServiceRequest request = new ServiceRequest();
-        request.setCustomer(userOpt.get());
-        request.setRequestType(requestDTO.getRequestType());
-        request.setPickupLatitude(requestDTO.getPickupLatitude());
-        request.setPickupLongitude(requestDTO.getPickupLongitude());
-        request.setAddress(requestDTO.getAddress());
-        request.setVehicleType(requestDTO.getVehicleType());
-        request.setLicensePlate(requestDTO.getLicensePlate());
-        request.setFuelType(requestDTO.getFuelType());
-        request.setFuelQuantity(requestDTO.getFuelQuantity());
-        request.setIssueType(requestDTO.getIssueType());
-        request.setNotes(requestDTO.getNotes());
+        request.setCustomer(customer);
+        request.setRequestType(dto.getRequestType());
+        request.setPickupLatitude(dto.getPickupLatitude());
+        request.setPickupLongitude(dto.getPickupLongitude());
+        request.setAddress(dto.getAddress());
+        request.setVehicleType(dto.getVehicleType());
+        request.setLicensePlate(dto.getLicensePlate());
+        request.setFuelType(dto.getFuelType());
+        request.setFuelQuantity(dto.getFuelQuantity());
+        request.setIssueType(dto.getIssueType());
+        request.setNotes(dto.getNotes());
+        //request.setPaymentMethod(dto.getPaymentMethod() != null ? dto.getPaymentMethod() : "CASH");
 
-        // Calculate estimated price
-        double estimatedPrice = pricingService.calculatePrice(request);
-        request.setEstimatedPrice(estimatedPrice);
+        double price = pricingService.calculatePrice(request);
+        request.setEstimatedPrice(price);
 
-        // Generate OTP for completion
+        // 4-digit OTP for service completion verification
         String otp = String.format("%04d", (int)(Math.random() * 10000));
         request.setOtpCode(otp);
 
         ServiceRequest saved = requestRepository.save(request);
 
-        Map<String, Object> response = new HashMap<>();
-        response.put("success", true);
-        response.put("requestId", saved.getId());
-        response.put("estimatedPrice", estimatedPrice);
-        response.put("otpCode", otp);
+        // Broadcast to all online drivers immediately
+        notificationService.notifyNewJobAvailable(saved);
 
-        return ResponseEntity.ok(response);
+        log.info("New {} request #{} created by customer {}", saved.getRequestType(), saved.getId(), userId);
+
+        return ResponseEntity.ok(Map.of(
+                "success",        true,
+                "requestId",      saved.getId(),
+                "estimatedPrice", price,
+                "otpCode",        otp,     // customer uses this to confirm completion
+                "message",        "Request submitted! We are finding a driver for you."
+        ));
     }
+
+    // ─── Customer queries ─────────────────────────────────────────────────────
 
     @GetMapping("/customer")
     public ResponseEntity<?> getCustomerRequests(@RequestHeader("Authorization") String authHeader) {
         Long userId = extractUserId(authHeader);
-        List<ServiceRequest> requests = requestRepository.findByCustomerId(userId);
-        return ResponseEntity.ok(requests);
+        return ResponseEntity.ok(requestRepository.findByCustomerId(userId));
+    }
+
+    @GetMapping("/customer/active")
+    public ResponseEntity<?> getActiveCustomerRequests(@RequestHeader("Authorization") String authHeader) {
+        Long userId = extractUserId(authHeader);
+        return ResponseEntity.ok(requestRepository.findActiveRequestsByCustomer(userId));
     }
 
     @GetMapping("/customer/{requestId}")
-    public ResponseEntity<?> getCustomerRequest(@RequestHeader("Authorization") String authHeader, @PathVariable Long requestId) {
+    public ResponseEntity<?> getCustomerRequest(
+            @RequestHeader("Authorization") String authHeader,
+            @PathVariable Long requestId) {
+
         Long userId = extractUserId(authHeader);
-        Optional<ServiceRequest> requestOpt = requestRepository.findById(requestId);
+        ServiceRequest request = requestRepository.findById(requestId)
+                .orElseThrow(() -> new RuntimeException("Request not found"));
 
-        if (requestOpt.isEmpty()) {
-            return ResponseEntity.notFound().build();
-        }
-
-        ServiceRequest request = requestOpt.get();
         if (!request.getCustomer().getId().equals(userId)) {
             return ResponseEntity.status(403).body(Map.of("error", "Unauthorized"));
         }
 
-        return ResponseEntity.ok(request);
+        // Include driver location if en route
+        Map<String, Object> result = new HashMap<>();
+        result.put("request", request);
+        if (request.getDriver() != null &&
+                ("EN_ROUTE".equals(request.getStatus()) || "IN_PROGRESS".equals(request.getStatus()))) {
+            result.put("driverLatitude",  request.getDriver().getCurrentLatitude());
+            result.put("driverLongitude", request.getDriver().getCurrentLongitude());
+        }
+
+        return ResponseEntity.ok(result);
     }
+
+    // ─── Driver queries ───────────────────────────────────────────────────────
 
     @GetMapping("/driver/pending")
     public ResponseEntity<?> getPendingRequests() {
-        List<ServiceRequest> pending = requestRepository.findByStatus("PENDING");
-        return ResponseEntity.ok(pending);
+        return ResponseEntity.ok(requestRepository.findByStatus("PENDING"));
     }
 
     @GetMapping("/driver/{driverId}")
     public ResponseEntity<?> getDriverRequests(@PathVariable Long driverId) {
-        List<ServiceRequest> requests = requestRepository.findByDriverId(driverId);
-        return ResponseEntity.ok(requests);
+        return ResponseEntity.ok(requestRepository.findByDriverId(driverId));
     }
+
+    // ─── Accept ───────────────────────────────────────────────────────────────
 
     @PutMapping("/{requestId}/accept")
     public ResponseEntity<?> acceptRequest(
@@ -121,30 +137,29 @@ public class ServiceRequestController {
             @PathVariable Long requestId) {
 
         Long driverId = extractUserId(authHeader);
-        Optional<ServiceRequest> requestOpt = requestRepository.findById(requestId);
+        ServiceRequest request = requestRepository.findById(requestId)
+                .orElseThrow(() -> new RuntimeException("Request not found"));
 
-        if (requestOpt.isEmpty()) {
-            return ResponseEntity.badRequest().body(Map.of("error", "Request not found"));
-        }
-
-        ServiceRequest request = requestOpt.get();
         if (!"PENDING".equals(request.getStatus())) {
             return ResponseEntity.badRequest().body(Map.of("error", "Request already accepted or completed"));
         }
 
-        Optional<User> driverOpt = userRepository.findById(driverId);
-        if (driverOpt.isEmpty() || !"DRIVER".equals(driverOpt.get().getUserType())) {
-            return ResponseEntity.badRequest().body(Map.of("error", "Invalid driver"));
+        User driver = userRepository.findById(driverId).orElseThrow();
+        if (!"DRIVER".equals(driver.getUserType())) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Only drivers can accept jobs"));
         }
 
-        request.setDriver(driverOpt.get());
+        request.setDriver(driver);
         request.setStatus("ACCEPTED");
         request.setAcceptedAt(LocalDateTime.now());
-
         requestRepository.save(request);
 
-        return ResponseEntity.ok(Map.of("success", true, "message", "Request accepted"));
+        notificationService.notifyJobAccepted(request);
+
+        return ResponseEntity.ok(Map.of("success", true, "message", "Request accepted. Head to the customer!"));
     }
+
+    // ─── Status update ────────────────────────────────────────────────────────
 
     @PutMapping("/{requestId}/status")
     public ResponseEntity<?> updateStatus(
@@ -153,16 +168,10 @@ public class ServiceRequestController {
             @Valid @RequestBody UpdateStatusDTO statusUpdate) {
 
         Long userId = extractUserId(authHeader);
-        Optional<ServiceRequest> requestOpt = requestRepository.findById(requestId);
+        ServiceRequest request = requestRepository.findById(requestId)
+                .orElseThrow(() -> new RuntimeException("Request not found"));
 
-        if (requestOpt.isEmpty()) {
-            return ResponseEntity.notFound().build();
-        }
-
-        ServiceRequest request = requestOpt.get();
-
-        // Check if user is driver assigned or customer
-        boolean isDriver = request.getDriver() != null && request.getDriver().getId().equals(userId);
+        boolean isDriver   = request.getDriver()   != null && request.getDriver().getId().equals(userId);
         boolean isCustomer = request.getCustomer().getId().equals(userId);
 
         if (!isDriver && !isCustomer) {
@@ -171,57 +180,54 @@ public class ServiceRequestController {
 
         String newStatus = statusUpdate.getStatus();
         request.setStatus(newStatus);
+        if (statusUpdate.getNotes()      != null) request.setNotes(statusUpdate.getNotes());
+        if (statusUpdate.getFinalPrice() != null) request.setFinalPrice(statusUpdate.getFinalPrice());
 
-        if (statusUpdate.getNotes() != null) {
-            request.setNotes(statusUpdate.getNotes());
-        }
-
-        if (statusUpdate.getFinalPrice() != null) {
-            request.setFinalPrice(statusUpdate.getFinalPrice());
-        }
-
-        if ("EN_ROUTE".equals(newStatus)) {
-            request.setStartedAt(LocalDateTime.now());
-        } else if ("COMPLETED".equals(newStatus)) {
-            request.setCompletedAt(LocalDateTime.now());
-            if (request.getFinalPrice() == null) {
-                request.setFinalPrice(request.getEstimatedPrice());
+        switch (newStatus) {
+            case "EN_ROUTE"   -> { request.setStartedAt(LocalDateTime.now()); notificationService.notifyDriverEnRoute(request); }
+            case "COMPLETED"  -> {
+                request.setCompletedAt(LocalDateTime.now());
+                if (request.getFinalPrice() == null) request.setFinalPrice(request.getEstimatedPrice());
+                requestRepository.save(request);
+                notificationService.notifyJobCompleted(request);
+                return ResponseEntity.ok(Map.of("success", true, "status", newStatus));
             }
+            case "CANCELLED"  -> notificationService.notifyJobCancelled(request, isCustomer ? "customer" : "driver");
         }
 
         requestRepository.save(request);
-
         return ResponseEntity.ok(Map.of("success", true, "status", newStatus));
     }
+
+    // ─── OTP completion ───────────────────────────────────────────────────────
 
     @PostMapping("/{requestId}/complete-with-otp")
     public ResponseEntity<?> completeWithOtp(
             @PathVariable Long requestId,
-            @RequestBody Map<String, String> completionData) {
+            @RequestBody Map<String, String> body) {
 
-        Optional<ServiceRequest> requestOpt = requestRepository.findById(requestId);
-        if (requestOpt.isEmpty()) {
-            return ResponseEntity.notFound().build();
-        }
+        ServiceRequest request = requestRepository.findById(requestId)
+                .orElseThrow(() -> new RuntimeException("Request not found"));
 
-        ServiceRequest request = requestOpt.get();
-        String providedOtp = completionData.get("otp");
-
-        if (!request.getOtpCode().equals(providedOtp)) {
-            return ResponseEntity.badRequest().body(Map.of("error", "Invalid OTP"));
+        if (!request.getOtpCode().equals(body.get("otp"))) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Invalid OTP — please check with the customer"));
         }
 
         request.setStatus("COMPLETED");
         request.setCompletedAt(LocalDateTime.now());
-
-        if (completionData.get("finalPrice") != null) {
-            request.setFinalPrice(Double.parseDouble(completionData.get("finalPrice")));
+        if (body.get("finalPrice") != null) {
+            request.setFinalPrice(Double.parseDouble(body.get("finalPrice")));
+        } else if (request.getFinalPrice() == null) {
+            request.setFinalPrice(request.getEstimatedPrice());
         }
 
         requestRepository.save(request);
+        notificationService.notifyJobCompleted(request);
 
-        return ResponseEntity.ok(Map.of("success", true, "message", "Service completed successfully"));
+        return ResponseEntity.ok(Map.of("success", true, "message", "Service completed successfully! Great job."));
     }
+
+    // ─── Cancel ───────────────────────────────────────────────────────────────
 
     @DeleteMapping("/{requestId}/cancel")
     public ResponseEntity<?> cancelRequest(
@@ -229,30 +235,27 @@ public class ServiceRequestController {
             @PathVariable Long requestId) {
 
         Long userId = extractUserId(authHeader);
-        Optional<ServiceRequest> requestOpt = requestRepository.findById(requestId);
-
-        if (requestOpt.isEmpty()) {
-            return ResponseEntity.notFound().build();
-        }
-
-        ServiceRequest request = requestOpt.get();
+        ServiceRequest request = requestRepository.findById(requestId)
+                .orElseThrow(() -> new RuntimeException("Request not found"));
 
         if (!request.getCustomer().getId().equals(userId)) {
             return ResponseEntity.status(403).body(Map.of("error", "Unauthorized"));
         }
 
-        if (!"PENDING".equals(request.getStatus())) {
-            return ResponseEntity.badRequest().body(Map.of("error", "Cannot cancel request in progress"));
+        if (!List.of("PENDING", "ACCEPTED").contains(request.getStatus())) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Cannot cancel a job that is already in progress"));
         }
 
         request.setStatus("CANCELLED");
         requestRepository.save(request);
+        notificationService.notifyJobCancelled(request, "customer");
 
         return ResponseEntity.ok(Map.of("success", true, "message", "Request cancelled"));
     }
 
+    // ─── Helper ───────────────────────────────────────────────────────────────
+
     private Long extractUserId(String authHeader) {
-        String token = authHeader.replace("Bearer ", "");
-        return Long.parseLong(jwtUtil.extractUserId(token));
+        return Long.parseLong(jwtUtil.extractUserId(authHeader.replace("Bearer ", "")));
     }
 }

@@ -1,7 +1,7 @@
 package com.vanguard.dto;
 
-import lombok.Data;
-import java.time.LocalDateTime;
+        import lombok.Data;
+        import java.time.LocalDateTime;
 
 @Data
 public class JobResponseDTO {

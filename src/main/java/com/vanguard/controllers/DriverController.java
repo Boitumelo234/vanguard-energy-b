@@ -3,79 +3,58 @@ package com.vanguard.controllers;
 import com.vanguard.dto.LocationUpdateDTO;
 import com.vanguard.dto.UpdateStatusDTO;
 import com.vanguard.entities.ServiceRequest;
-import com.vanguard.entities.User;
-import com.vanguard.repositories.UserRepository;
 import com.vanguard.services.DriverService;
 import com.vanguard.utils.JwtUtil;
+import jakarta.validation.Valid;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import jakarta.validation.Valid;
-import java.util.HashMap;
+
 import java.util.List;
 import java.util.Map;
 
 @RestController
 @RequestMapping("/driver")
 @CrossOrigin(origins = {"http://localhost:3000", "http://localhost:3001"})
+@Slf4j
 public class DriverController {
 
-    @Autowired
-    private DriverService driverService;
+    @Autowired private DriverService driverService;
+    @Autowired private JwtUtil jwtUtil;
 
-    @Autowired
-    private UserRepository userRepository;
-
-    @Autowired
-    private JwtUtil jwtUtil;
+    // ─── Shift ────────────────────────────────────────────────────────────────
 
     @PostMapping("/shift/start")
     public ResponseEntity<?> startShift(@RequestHeader("Authorization") String authHeader) {
         try {
-            Long driverId = extractUserId(authHeader);
-            System.out.println("Starting shift for driver: " + driverId);
-            Map<String, Object> result = driverService.startShift(driverId);
-            return ResponseEntity.ok(result);
+            return ResponseEntity.ok(driverService.startShift(extractUserId(authHeader)));
         } catch (RuntimeException e) {
-            System.err.println("Error starting shift: " + e.getMessage());
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
-        } catch (Exception e) {
-            System.err.println("Unexpected error: " + e.getMessage());
-            e.printStackTrace();
-            return ResponseEntity.status(500).body(Map.of("error", "Internal server error: " + e.getMessage()));
         }
     }
 
     @PostMapping("/shift/end")
     public ResponseEntity<?> endShift(@RequestHeader("Authorization") String authHeader) {
         try {
-            Long driverId = extractUserId(authHeader);
-            System.out.println("Ending shift for driver: " + driverId);
-            Map<String, Object> result = driverService.endShift(driverId);
-            return ResponseEntity.ok(result);
+            return ResponseEntity.ok(driverService.endShift(extractUserId(authHeader)));
         } catch (RuntimeException e) {
-            System.err.println("Error ending shift: " + e.getMessage());
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
-        } catch (Exception e) {
-            System.err.println("Unexpected error: " + e.getMessage());
-            e.printStackTrace();
-            return ResponseEntity.status(500).body(Map.of("error", "Internal server error: " + e.getMessage()));
         }
     }
+
+    // ─── Stats ────────────────────────────────────────────────────────────────
 
     @GetMapping("/stats")
     public ResponseEntity<?> getStats(@RequestHeader("Authorization") String authHeader) {
         try {
-            Long driverId = extractUserId(authHeader);
-            System.out.println("Getting stats for driver: " + driverId);
-            Map<String, Object> stats = driverService.getDriverStats(driverId);
-            return ResponseEntity.ok(stats);
+            return ResponseEntity.ok(driverService.getDriverStats(extractUserId(authHeader)));
         } catch (Exception e) {
-            System.err.println("Error getting stats: " + e.getMessage());
-            e.printStackTrace();
             return ResponseEntity.status(500).body(Map.of("error", "Failed to fetch stats: " + e.getMessage()));
         }
     }
+
+    // ─── Jobs ─────────────────────────────────────────────────────────────────
 
     @GetMapping("/jobs/available")
     public ResponseEntity<?> getAvailableJobs() {
@@ -83,7 +62,7 @@ public class DriverController {
             List<ServiceRequest> jobs = driverService.getAvailableJobs();
             return ResponseEntity.ok(jobs);
         } catch (Exception e) {
-            return ResponseEntity.status(500).body(Map.of("error", "Failed to fetch jobs: " + e.getMessage()));
+            return ResponseEntity.status(500).body(Map.of("error", "Failed to fetch jobs"));
         }
     }
 
@@ -92,9 +71,7 @@ public class DriverController {
             @RequestHeader("Authorization") String authHeader,
             @PathVariable Long jobId) {
         try {
-            Long driverId = extractUserId(authHeader);
-            ServiceRequest accepted = driverService.acceptJob(driverId, jobId);
-            return ResponseEntity.ok(accepted);
+            return ResponseEntity.ok(driverService.acceptJob(extractUserId(authHeader), jobId));
         } catch (RuntimeException e) {
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
         }
@@ -104,16 +81,11 @@ public class DriverController {
     public ResponseEntity<?> updateJobStatus(
             @RequestHeader("Authorization") String authHeader,
             @PathVariable Long jobId,
-            @Valid @RequestBody UpdateStatusDTO statusUpdate) {
+            @Valid @RequestBody UpdateStatusDTO dto) {
         try {
             Long driverId = extractUserId(authHeader);
             ServiceRequest updated = driverService.updateJobStatus(
-                    driverId,
-                    jobId,
-                    statusUpdate.getStatus(),
-                    statusUpdate.getNotes(),
-                    statusUpdate.getFinalPrice(),
-                    statusUpdate.getFuelDelivered()
+                    driverId, jobId, dto.getStatus(), dto.getNotes(), dto.getFinalPrice(), dto.getFuelDelivered()
             );
             return ResponseEntity.ok(updated);
         } catch (RuntimeException e) {
@@ -124,32 +96,35 @@ public class DriverController {
     @GetMapping("/jobs")
     public ResponseEntity<?> getMyJobs(@RequestHeader("Authorization") String authHeader) {
         try {
-            Long driverId = extractUserId(authHeader);
-            List<ServiceRequest> jobs = driverService.getDriverJobs(driverId);
-            return ResponseEntity.ok(jobs);
+            return ResponseEntity.ok(driverService.getDriverJobs(extractUserId(authHeader)));
         } catch (Exception e) {
-            return ResponseEntity.status(500).body(Map.of("error", "Failed to fetch jobs: " + e.getMessage()));
+            return ResponseEntity.status(500).body(Map.of("error", "Failed to fetch jobs"));
         }
     }
 
+    // ─── Location ─────────────────────────────────────────────────────────────
+
+    /**
+     * The driver app calls this every ~5–10 seconds while on a job.
+     * The service persists the lat/lng to the User entity AND broadcasts
+     * it via WebSocket to /topic/driver/{id}/location and /topic/job/{jobId}.
+     */
     @PostMapping("/location")
     public ResponseEntity<?> updateLocation(
             @RequestHeader("Authorization") String authHeader,
             @Valid @RequestBody LocationUpdateDTO locationUpdate) {
         try {
             Long driverId = extractUserId(authHeader);
-            User driver = userRepository.findById(driverId).orElseThrow();
-            driver.setCurrentLatitude(locationUpdate.getLatitude());
-            driver.setCurrentLongitude(locationUpdate.getLongitude());
-            userRepository.save(driver);
-            return ResponseEntity.ok(Map.of("success", true, "message", "Location updated"));
+            driverService.updateLocation(driverId, locationUpdate.getLatitude(), locationUpdate.getLongitude());
+            return ResponseEntity.ok(Map.of("success", true));
         } catch (Exception e) {
-            return ResponseEntity.status(500).body(Map.of("error", "Failed to update location: " + e.getMessage()));
+            return ResponseEntity.status(500).body(Map.of("error", "Failed to update location"));
         }
     }
 
+    // ─── Helper ───────────────────────────────────────────────────────────────
+
     private Long extractUserId(String authHeader) {
-        String token = authHeader.replace("Bearer ", "");
-        return Long.parseLong(jwtUtil.extractUserId(token));
+        return Long.parseLong(jwtUtil.extractUserId(authHeader.replace("Bearer ", "")));
     }
 }
